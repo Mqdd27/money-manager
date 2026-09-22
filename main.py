@@ -1,22 +1,27 @@
 import base64
 import hashlib
-import os
+import sqlite3
 import secrets
 import sys
 import tkinter as tk
+import json
+from urllib.request import Request, urlopen
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from contextlib import contextmanager
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-
-import psycopg
-from dotenv import load_dotenv
-from psycopg.rows import dict_row
-
-load_dotenv()
-
 
 GREEN, TEXT, MUTED, BG = "#1f8f5f", "#17212b", "#667085", "#f5f7fb"
 CATEGORIES = ["Food", "Transport", "Bills", "Shopping", "Salary", "Investment", "Health", "Other"]
+DECIMAL_COLUMNS = {"balance", "amount", "target", "saved", "rate_to_base", "fx_rate", "base_amount", "total"}
+SUPPORTED_CURRENCIES = {
+    "IDR": ("Indonesian Rupiah", "Rp"), "USD": ("US Dollar", "$"), "EUR": ("Euro", "€"),
+    "SGD": ("Singapore Dollar", "S$"), "GBP": ("British Pound", "£"), "JPY": ("Japanese Yen", "¥"),
+    "AUD": ("Australian Dollar", "A$"), "CAD": ("Canadian Dollar", "C$"), "CHF": ("Swiss Franc", "CHF"),
+    "CNY": ("Chinese Yuan", "¥"), "HKD": ("Hong Kong Dollar", "HK$"), "MYR": ("Malaysian Ringgit", "RM"),
+    "THB": ("Thai Baht", "฿"),
+}
 
 
 def amount(value, positive=True):
@@ -44,28 +49,79 @@ def check_pin(pin, stored):
     return secrets.compare_digest(hashlib.pbkdf2_hmac("sha256", pin.encode(), raw[:16], 240_000), raw[16:])
 
 
+class SQLiteDB:
+    def __init__(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(path)
+        self.connection.row_factory = self.row
+        self.connection.execute("PRAGMA foreign_keys = ON")
+
+    @staticmethod
+    def row(cursor, values):
+        return {column[0]: (Decimal(str(value)) if column[0] in DECIMAL_COLUMNS and value is not None else value) for column, value in zip(cursor.description, values)}
+
+    def execute(self, query, params=()):
+        params = tuple(str(value) if isinstance(value, Decimal) else value for value in params)
+        return self.connection.execute(query.replace("%s", "?"), params)
+
+    def executescript(self, query):
+        return self.connection.executescript(query)
+
+    @contextmanager
+    def transaction(self):
+        try:
+            yield self
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def commit(self):
+        self.connection.commit()
+
+    def close(self):
+        self.connection.close()
+
+
 class Store:
     def __init__(self):
-        url = os.getenv("DATABASE_URL")
-        if not url:
-            raise RuntimeError("DATABASE_URL is missing. Add your PostgreSQL connection string to .env.")
-        url = url.replace("postgresql+psycopg://", "postgresql://", 1)
-        self.db = psycopg.connect(url, row_factory=dict_row)
-        self.db.autocommit = False
-        self.db.execute("""
+        data_dir = Path.home() / "Library" / "Application Support" / "MoneyManager" if sys.platform == "darwin" else Path(__file__).resolve().parent
+        self.db = SQLiteDB(data_dir / "money_manager.db")
+        self.db.executescript("""
             CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS currencies (code VARCHAR(3) PRIMARY KEY, name TEXT NOT NULL, symbol TEXT NOT NULL, rate_to_base NUMERIC(20,8) NOT NULL);
-            CREATE TABLE IF NOT EXISTS accounts (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, currency VARCHAR(3) NOT NULL REFERENCES currencies(code), balance NUMERIC(20,2) NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS transactions (id BIGSERIAL PRIMARY KEY, account_id BIGINT NOT NULL REFERENCES accounts(id), kind TEXT NOT NULL CHECK(kind IN ('Income','Expense')), amount NUMERIC(20,2) NOT NULL CHECK(amount > 0), currency VARCHAR(3) NOT NULL REFERENCES currencies(code), fx_rate NUMERIC(20,8) NOT NULL, base_amount NUMERIC(20,2) NOT NULL, category TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', happened_on DATE NOT NULL);
-            CREATE TABLE IF NOT EXISTS budgets (id BIGSERIAL PRIMARY KEY, category TEXT NOT NULL, amount NUMERIC(20,2) NOT NULL, currency VARCHAR(3) NOT NULL REFERENCES currencies(code), month DATE NOT NULL);
-            CREATE TABLE IF NOT EXISTS goals (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, target NUMERIC(20,2) NOT NULL, saved NUMERIC(20,2) NOT NULL DEFAULT 0, currency VARCHAR(3) NOT NULL REFERENCES currencies(code), deadline DATE);
-            CREATE TABLE IF NOT EXISTS bills (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, amount NUMERIC(20,2) NOT NULL, currency VARCHAR(3) NOT NULL REFERENCES currencies(code), due_date DATE NOT NULL, paid BOOLEAN NOT NULL DEFAULT FALSE);
-            CREATE TABLE IF NOT EXISTS assets (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, value NUMERIC(20,2) NOT NULL, currency VARCHAR(3) NOT NULL REFERENCES currencies(code));
+            CREATE TABLE IF NOT EXISTS currencies (code TEXT PRIMARY KEY, name TEXT NOT NULL, symbol TEXT NOT NULL, rate_to_base NUMERIC NOT NULL);
+            CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL, currency TEXT NOT NULL REFERENCES currencies(code), balance NUMERIC NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL REFERENCES accounts(id), kind TEXT NOT NULL CHECK(kind IN ('Income','Expense')), amount NUMERIC NOT NULL CHECK(amount > 0), currency TEXT NOT NULL REFERENCES currencies(code), fx_rate NUMERIC NOT NULL, base_amount NUMERIC NOT NULL, category TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', happened_on TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS budgets (id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL, amount NUMERIC NOT NULL, currency TEXT NOT NULL REFERENCES currencies(code), month TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS goals (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, target NUMERIC NOT NULL, saved NUMERIC NOT NULL DEFAULT 0, currency TEXT NOT NULL REFERENCES currencies(code), deadline TEXT);
+            CREATE TABLE IF NOT EXISTS bills (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, amount NUMERIC NOT NULL, currency TEXT NOT NULL REFERENCES currencies(code), due_date TEXT NOT NULL, paid INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS assets (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL, value NUMERIC NOT NULL, currency TEXT NOT NULL REFERENCES currencies(code));
         """)
         self.db.execute("INSERT INTO app_settings(key,value) VALUES ('base_currency','IDR') ON CONFLICT DO NOTHING")
-        for row in (("IDR", "Indonesian Rupiah", "Rp", "1"), ("USD", "US Dollar", "$", "16000"), ("EUR", "Euro", "€", "18000"), ("SGD", "Singapore Dollar", "S$", "12500")):
-            self.db.execute("INSERT INTO currencies(code,name,symbol,rate_to_base) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING", row)
+        name, symbol = SUPPORTED_CURRENCIES["IDR"]
+        self.db.execute("INSERT INTO currencies(code,name,symbol,rate_to_base) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING", ("IDR", name, symbol, Decimal("1")))
+        self.refresh_rates()
         self.db.commit()
+
+    def refresh_rates(self):
+        try:
+            request = Request("https://open.er-api.com/v6/latest/USD", headers={"User-Agent": "MoneyManager/1.0"})
+            with urlopen(request, timeout=10) as response:
+                payload = json.load(response)
+            if payload.get("result") != "success":
+                raise RuntimeError(payload.get("error-type", "The rate API returned an error"))
+            usd_rates = {code: Decimal(str(rate)) for code, rate in payload["rates"].items()}
+            idr_per_usd = usd_rates["IDR"]
+            with self.db.transaction():
+                for code, (name, symbol) in SUPPORTED_CURRENCIES.items():
+                    rate_to_base = Decimal("1") if code == "IDR" else idr_per_usd / usd_rates[code]
+                    self.db.execute("INSERT INTO currencies(code,name,symbol,rate_to_base) VALUES (%s,%s,%s,%s) ON CONFLICT(code) DO UPDATE SET name=excluded.name,symbol=excluded.symbol,rate_to_base=excluded.rate_to_base", (code, name, symbol, rate_to_base))
+                self.db.execute("INSERT INTO app_settings(key,value) VALUES ('rates_updated_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (payload.get("time_last_update_utc", "live"),))
+            self.rate_error = None
+            return True
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            self.rate_error = str(error)
+            return False
 
     def setting(self, key):
         row = self.db.execute("SELECT value FROM app_settings WHERE key=%s", (key,)).fetchone()
@@ -99,6 +155,11 @@ class Store:
         with self.db.transaction():
             self.db.execute("UPDATE accounts SET name=%s, kind=%s, currency=%s, balance=%s WHERE id=%s", (name, kind, currency, balance, account_id))
 
+    def delete_account(self, account_id):
+        with self.db.transaction():
+            self.db.execute("DELETE FROM transactions WHERE account_id=%s", (account_id,))
+            self.db.execute("DELETE FROM accounts WHERE id=%s", (account_id,))
+
     def record(self, table, record_id):
         return self.db.execute(f"SELECT * FROM {table} WHERE id=%s", (record_id,)).fetchone()
 
@@ -122,6 +183,20 @@ class Store:
             self.db.execute("UPDATE accounts SET balance=balance+%s WHERE id=%s", (new_change, account_id))
             self.db.execute("UPDATE transactions SET account_id=%s,kind=%s,amount=%s,currency=%s,fx_rate=%s,base_amount=%s,category=%s,note=%s,happened_on=%s WHERE id=%s", (account_id, kind, value, currency, fx_rate, value * fx_rate, category, note, happened_on, transaction_id))
 
+    def delete_transaction(self, transaction_id):
+        row = self.record("transactions", transaction_id)
+        rates = self.rates()
+        account = self.account(row["account_id"])
+        value = row["amount"] * row["fx_rate"] / rates[account["currency"]]["rate_to_base"]
+        change = value if row["kind"] == "Income" else -value
+        with self.db.transaction():
+            self.db.execute("UPDATE accounts SET balance=balance-%s WHERE id=%s", (change, row["account_id"]))
+            self.db.execute("DELETE FROM transactions WHERE id=%s", (transaction_id,))
+
+    def delete_record(self, table, record_id):
+        with self.db.transaction():
+            self.db.execute(f"DELETE FROM {table} WHERE id=%s", (record_id,))
+
     def add_transaction(self, account_id, kind, value, currency, category, note, happened_on):
         rates = self.rates()
         base_value = value * rates[currency]["rate_to_base"]
@@ -140,7 +215,7 @@ class Store:
     def summary(self):
         rates = self.rates()
         total = sum((row["balance"] * rates[row["currency"]]["rate_to_base"] for row in self.accounts()), Decimal(0))
-        row = self.db.execute("SELECT COALESCE(SUM(base_amount) FILTER (WHERE kind='Income'),0) income, COALESCE(SUM(base_amount) FILTER (WHERE kind='Expense'),0) expenses FROM transactions").fetchone()
+        row = self.db.execute("SELECT COALESCE(SUM(CASE WHEN kind='Income' THEN base_amount ELSE 0 END),0) income, COALESCE(SUM(CASE WHEN kind='Expense' THEN base_amount ELSE 0 END),0) expenses FROM transactions").fetchone()
         return total, row["income"], row["expenses"]
 
     def close(self):
@@ -169,9 +244,9 @@ def touch_id():
         return False
 
 
-class Auth(tk.Tk):
-    def __init__(self, store):
-        super().__init__()
+class Auth(tk.Toplevel):
+    def __init__(self, parent, store):
+        super().__init__(parent)
         self.store, self.ok = store, False
         self.title("Unlock Money Manager")
         self.geometry("390x270")
@@ -239,10 +314,11 @@ class Form(tk.Toplevel):
         messagebox.showerror("Check your input", message, parent=self)
 
 
-class MoneyManager(tk.Tk):
-    def __init__(self, store):
-        super().__init__()
+class MoneyManager(tk.Toplevel):
+    def __init__(self, parent, store):
+        super().__init__(parent)
         self.store, self.rates = store, store.rates()
+        self.amounts_hidden = False
         self.base = store.setting("base_currency")
         self.symbols = {code: row["symbol"] for code, row in self.rates.items()}
         self.title("Money Manager")
@@ -274,10 +350,12 @@ class MoneyManager(tk.Tk):
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
         tk.Label(side, text="Money Manager", bg="#0f172a", fg="#ffffff", font=("Arial", 18, "bold"), anchor="w").pack(fill="x", padx=24, pady=(28, 30))
-        pages = (("Dashboard", self.dashboard), ("Accounts", self.accounts_page), ("Transactions", self.transactions_page), ("Budgets", self.budgets_page), ("Savings goals", self.goals_page), ("Bills", self.bills_page), ("Assets", self.assets_page), ("Reports", self.reports_page))
+        pages = (("Dashboard", self.dashboard), ("Accounts", self.accounts_page), ("Transactions", self.transactions_page), ("Budgets", self.budgets_page), ("Savings goals", self.goals_page), ("Bills", self.bills_page), ("Assets", self.assets_page), ("Reports", self.reports_page), ("Exchange rates", self.rates_page))
         for label, command in pages:
             tk.Button(side, text=label, command=command, anchor="w", relief="flat", bd=0, bg="#e2e8f0", fg="#0f172a", activebackground="#2563eb", activeforeground="#ffffff", font=("Arial", 11, "bold"), padx=24, pady=10).pack(fill="x", pady=2)
-        tk.Label(side, text=f"Base currency: {self.base}\nPostgreSQL", bg="#0f172a", fg="#cbd5e1", justify="left", font=("Arial", 9)).pack(side="bottom", anchor="w", padx=24, pady=24)
+        tk.Button(side, text="Refresh exchange rates", command=self.refresh_rates, anchor="w", relief="flat", bd=0, bg="#0f172a", fg="#93c5fd", activebackground="#1e293b", activeforeground="#ffffff", font=("Arial", 10, "bold"), padx=24, pady=10).pack(fill="x", side="bottom")
+        rate_status = self.store.setting("rates_updated_at") or ("Unavailable" if self.store.rate_error else "Ready")
+        tk.Label(side, text=f"Base currency: {self.base}\nRates: {rate_status}", bg="#0f172a", fg="#cbd5e1", justify="left", font=("Arial", 9)).pack(side="bottom", anchor="w", padx=24, pady=12)
         self.content = ttk.Frame(self, padding=32)
         self.content.pack(side="left", fill="both", expand=True)
 
@@ -285,10 +363,25 @@ class MoneyManager(tk.Tk):
         for child in self.content.winfo_children():
             child.destroy()
 
-    def heading(self, title, subtitle, button=None):
+    def refresh_rates(self):
+        if self.store.refresh_rates():
+            self.rates = self.store.rates()
+            self.symbols = {code: row["symbol"] for code, row in self.rates.items()}
+            messagebox.showinfo("Rates updated", "Exchange rates were updated from the live API.", parent=self)
+            self.dashboard()
+        else:
+            messagebox.showerror("Rates unavailable", f"The live exchange-rate API could not be reached. Cached rates were kept.\n\n{self.store.rate_error}", parent=self)
+
+    def toggle_dashboard_amounts(self):
+        self.amounts_hidden = not self.amounts_hidden
+        self.dashboard()
+
+    def heading(self, title, subtitle, button=None, secondary=None):
         top = ttk.Frame(self.content)
         top.pack(fill="x", pady=(0, 26))
         ttk.Label(top, text=title, style="Title.TLabel").pack(side="left")
+        if secondary and secondary[1]:
+            ttk.Button(top, text=secondary[0], command=secondary[1]).pack(side="right", padx=(0, 8))
         if button and button[1]:
             ttk.Button(top, text=button[0], command=button[1], style="Accent.TButton").pack(side="right")
         ttk.Label(self.content, text=subtitle, style="Muted.TLabel").pack(anchor="w", pady=(0, 22))
@@ -300,24 +393,26 @@ class MoneyManager(tk.Tk):
         tk.Label(frame, text=value, bg="white", fg=color, font=("Arial", 17, "bold")).pack(anchor="w", pady=(9, 0))
 
     def dashboard(self):
-        self.clear(); self.heading("Dashboard", "Your financial overview", ("+ Add transaction", self.add_transaction))
+        self.clear(); self.heading("Dashboard", "Your financial overview", ("+ Add transaction", self.add_transaction), ("Show amounts" if self.amounts_hidden else "Hide amounts", self.toggle_dashboard_amounts))
         total, income, expenses = self.store.summary()
         cards = ttk.Frame(self.content); cards.pack(fill="x", pady=(0, 24))
-        self.card(cards, "Net worth", money(total / self.rates[self.base]["rate_to_base"], self.base, self.symbols), GREEN)
-        self.card(cards, "Income", money(income / self.rates[self.base]["rate_to_base"], self.base, self.symbols), GREEN)
-        self.card(cards, "Expenses", money(expenses / self.rates[self.base]["rate_to_base"], self.base, self.symbols), "#c2413b")
+        hidden = "••••••" if self.amounts_hidden else None
+        self.card(cards, "Net worth", hidden or money(total / self.rates[self.base]["rate_to_base"], self.base, self.symbols), GREEN)
+        self.card(cards, "Income", hidden or money(income / self.rates[self.base]["rate_to_base"], self.base, self.symbols), GREEN)
+        self.card(cards, "Expenses", hidden or money(expenses / self.rates[self.base]["rate_to_base"], self.base, self.symbols), "#c2413b")
         box = ttk.Frame(self.content, style="Card.TFrame", padding=18); box.pack(fill="both", expand=True)
         ttk.Label(box, text="Recent transactions", background="white", font=("Arial", 13, "bold")).pack(anchor="w", pady=(0, 10))
-        self.transaction_table(box, self.store.transactions(10))
+        self.transaction_table(box, self.store.transactions(10), self.amounts_hidden)
 
-    def transaction_table(self, parent, rows):
+    def transaction_table(self, parent, rows, mask_amounts=False):
         tree = ttk.Treeview(parent, columns=("date", "description", "account", "currency", "amount"), show="headings")
         for key, title, width in (("date", "Date", 95), ("description", "Description", 210), ("account", "Account", 140), ("currency", "Currency", 80), ("amount", "Amount", 130)):
             tree.heading(key, text=title); tree.column(key, width=width, anchor="e" if key == "amount" else "w")
         tree.tag_configure("income", foreground=GREEN); tree.tag_configure("expense", foreground="#c2413b")
         for row in rows:
             sign = "+" if row["kind"] == "Income" else "-"
-            tree.insert("", "end", iid=str(row["id"]), values=(row["happened_on"], row["note"] or row["category"], row["account_name"], row["currency"], sign + money(row["amount"], row["currency"], self.symbols)), tags=(row["kind"].lower(),))
+            shown_amount = "••••••" if mask_amounts else sign + money(row["amount"], row["currency"], self.symbols)
+            tree.insert("", "end", iid=str(row["id"]), values=(row["happened_on"], row["note"] or row["category"], row["account_name"], row["currency"], shown_amount), tags=(row["kind"].lower(),))
         tree.pack(fill="both", expand=True)
         return tree
 
@@ -330,6 +425,7 @@ class MoneyManager(tk.Tk):
             tree.heading(key, text=title); tree.column(key, anchor="e" if key == "balance" else "w")
         for row in self.store.accounts(): tree.insert("", "end", iid=str(row["id"]), values=(row["name"], row["kind"], row["currency"], money(row["balance"], row["currency"], self.symbols)))
         ttk.Button(toolbar, text="Edit selected", command=lambda: self.edit_account(tree)).pack(side="right")
+        ttk.Button(toolbar, text="Delete selected", command=lambda: self.delete_account(tree)).pack(side="right", padx=(0, 8))
         tree.bind("<Double-1>", lambda _: self.edit_account(tree))
         tree.pack(fill="both", expand=True)
 
@@ -339,10 +435,11 @@ class MoneyManager(tk.Tk):
         toolbar = ttk.Frame(box, style="Card.TFrame"); toolbar.pack(fill="x", pady=(0, 10))
         tree = self.transaction_table(box, self.store.transactions())
         ttk.Button(toolbar, text="Edit selected", command=lambda: self.edit_transaction(tree)).pack(side="right")
+        ttk.Button(toolbar, text="Delete selected", command=lambda: self.delete_transaction(tree)).pack(side="right", padx=(0, 8))
         tree.bind("<Double-1>", lambda _: self.edit_transaction(tree))
 
-    def simple_page(self, title, subtitle, table, columns, rows, action, edit=None):
-        self.clear(); self.heading(title, subtitle, ("+ Add", action))
+    def simple_page(self, title, subtitle, table, columns, rows, action, edit=None, secondary=None):
+        self.clear(); self.heading(title, subtitle, ("+ Add", action), secondary)
         box = ttk.Frame(self.content, style="Card.TFrame", padding=18); box.pack(fill="both", expand=True)
         toolbar = ttk.Frame(box, style="Card.TFrame"); toolbar.pack(fill="x", pady=(0, 10))
         tree = ttk.Treeview(box, columns=columns, show="headings")
@@ -351,6 +448,8 @@ class MoneyManager(tk.Tk):
         if edit:
             ttk.Button(toolbar, text="Edit selected", command=lambda: edit(tree)).pack(side="right")
             tree.bind("<Double-1>", lambda _: edit(tree))
+        if action:
+            ttk.Button(toolbar, text="Delete selected", command=lambda: self.delete_simple(table, tree, action)).pack(side="right", padx=(0, 8))
         tree.pack(fill="both", expand=True)
 
     def budgets_page(self):
@@ -367,7 +466,12 @@ class MoneyManager(tk.Tk):
 
     def assets_page(self):
         rows = self.store.db.execute("SELECT * FROM assets ORDER BY name").fetchall()
-        self.simple_page("Assets", "Track investments and other holdings", "assets", ("name", "kind", "value", "currency"), [{**r, "value": money(r["value"], r["currency"], self.symbols)} for r in rows], self.add_asset, self.edit_asset)
+        displayed = [{**r, "value": "••••••" if self.amounts_hidden else money(r["value"], r["currency"], self.symbols)} for r in rows]
+        self.simple_page("Assets", "Track investments and other holdings", "assets", ("name", "kind", "value", "currency"), displayed, self.add_asset, self.edit_asset, ("Show amounts" if self.amounts_hidden else "Hide amounts", self.toggle_asset_amounts))
+
+    def toggle_asset_amounts(self):
+        self.amounts_hidden = not self.amounts_hidden
+        self.assets_page()
 
     def reports_page(self):
         rows = self.store.db.execute("SELECT category, currency, SUM(amount) total FROM transactions WHERE kind='Expense' GROUP BY category,currency ORDER BY total DESC").fetchall()
@@ -381,6 +485,19 @@ class MoneyManager(tk.Tk):
             tree.heading(key, text=title); tree.column(key, anchor="e" if key == "total" else "w")
         for row in rows:
             tree.insert("", "end", values=(row["category"], money(row["total"], row["currency"], self.symbols), row["currency"]))
+        tree.pack(fill="both", expand=True)
+
+    def rates_page(self):
+        self.clear()
+        self.heading("Exchange rates", "Live conversion rates against Indonesian Rupiah", ("Refresh rates", self.refresh_rates))
+        box = ttk.Frame(self.content, style="Card.TFrame", padding=18); box.pack(fill="both", expand=True)
+        updated = self.store.setting("rates_updated_at") or "Not updated yet"
+        ttk.Label(box, text=f"Source: ExchangeRate-API  •  Last updated: {updated}", style="Muted.TLabel", background="white").pack(anchor="w", pady=(0, 12))
+        tree = ttk.Treeview(box, columns=("code", "name", "symbol", "rate"), show="headings")
+        for key, title, width in (("code", "Code", 90), ("name", "Currency", 220), ("symbol", "Symbol", 100), ("rate", "1 unit in IDR", 160)):
+            tree.heading(key, text=title); tree.column(key, width=width, anchor="e" if key == "rate" else "w")
+        for row in self.store.currencies():
+            tree.insert("", "end", values=(row["code"], row["name"], row["symbol"], f"Rp {row['rate_to_base']:,.4f}"))
         tree.pack(fill="both", expand=True)
 
     def report_data(self):
@@ -483,6 +600,25 @@ class MoneyManager(tk.Tk):
             return None
         return self.store.record(table, int(selected[0]))
 
+    def delete_account(self, tree):
+        row = self.selected_record(tree, "accounts")
+        if not row or not messagebox.askyesno("Delete account", f"Delete {row['name']} and all its transactions?", parent=self):
+            return
+        self.store.delete_account(row["id"]); self.accounts_page()
+
+    def delete_transaction(self, tree):
+        row = self.selected_record(tree, "transactions")
+        if not row or not messagebox.askyesno("Delete transaction", "Delete this transaction and recalculate the account balance?", parent=self):
+            return
+        self.store.delete_transaction(row["id"]); self.transactions_page()
+
+    def delete_simple(self, table, tree, refresh):
+        row = self.selected_record(tree, table)
+        if not row or not messagebox.askyesno("Delete item", "Delete this item?", parent=self):
+            return
+        self.store.delete_record(table, row["id"])
+        {"budgets": self.budgets_page, "goals": self.goals_page, "bills": self.bills_page, "assets": self.assets_page}[table]()
+
     def edit_transaction(self, tree):
         row = self.selected_record(tree, "transactions")
         if not row:
@@ -524,7 +660,7 @@ class MoneyManager(tk.Tk):
     def edit_bill(self, tree):
         row = self.selected_record(tree, "bills")
         if not row: return
-        f = Form(self, "Edit bill"); name = f.entry("Bill name", row["name"]); value = f.entry("Amount", str(row["amount"])); currency = f.combo("Currency", list(self.rates)); currency.set(row["currency"]); due = f.entry("Due date", str(row["due_date"])); paid = f.combo("Status", ["False", "True"]); paid.set(str(row["paid"]))
+        f = Form(self, "Edit bill"); name = f.entry("Bill name", row["name"]); value = f.entry("Amount", str(row["amount"])); currency = f.combo("Currency", list(self.rates)); currency.set(row["currency"]); due = f.entry("Due date", str(row["due_date"])); paid = f.combo("Status", ["False", "True"]); paid.set(str(bool(row["paid"])))
         def save():
             try: value2 = amount(value.get()); date.fromisoformat(due.get())
             except ValueError as e: return f.error(str(e))
@@ -584,7 +720,7 @@ class MoneyManager(tk.Tk):
         f.save(save)
 
     def close(self):
-        self.store.close(); self.destroy()
+        self.store.close(); self.destroy(); self.master.destroy()
 
 
 def check():
@@ -599,9 +735,12 @@ if __name__ == "__main__":
         check()
     else:
         store = Store()
-        gate = Auth(store)
-        gate.mainloop()
+        root = tk.Tk()
+        root.withdraw()
+        gate = Auth(root, store)
+        root.wait_window(gate)
         if gate.ok:
-            MoneyManager(store).mainloop()
+            MoneyManager(root, store)
+            root.mainloop()
         else:
-            store.close()
+            store.close(); root.destroy()

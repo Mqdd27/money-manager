@@ -1,10 +1,10 @@
-"""PostgreSQL connection helper."""
+"""Local SQLite database location."""
 
-import os
-
-import psycopg
+import sqlite3
+from pathlib import Path
 
 
 def connect():
-    url = os.environ["DATABASE_URL"].replace("postgresql+psycopg://", "postgresql://", 1)
-    return psycopg.connect(url)
+    path = Path.home() / "Library" / "Application Support" / "MoneyManager" / "money_manager.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(path)
