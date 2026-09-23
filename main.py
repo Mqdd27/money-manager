@@ -592,6 +592,7 @@ class MoneyManager(tk.Toplevel):
                 return f.error(str(e))
             self.store.update_account(row["id"], name.get().strip(), kind.get(), currency.get(), value)
             f.destroy(); self.accounts_page()
+        f.save(save)
 
     def selected_record(self, tree, table):
         selected = tree.selection()
